@@ -87,7 +87,6 @@ class Alchemy(Web3Provider, UpstreamProvider):
         # overwrite for testing
         self.block_page_size = 5000
         self.concurrency = 1
-        print(f"setting block_page_size to {self.block_page_size} and concurrency to {self.concurrency}")
 
     @property
     def uri(self):
