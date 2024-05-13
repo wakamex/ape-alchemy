@@ -1,9 +1,8 @@
 import os
 import random
 import time
-from typing import Any, Dict, Iterator, List, Optional, cast
+from typing import Any, Dict, List, Optional, cast
 
-import numpy.random as random
 from ape.api import PluginConfig, ReceiptAPI, TransactionAPI, UpstreamProvider
 from ape.exceptions import (
     APINotImplementedError,
@@ -255,7 +254,7 @@ class Alchemy(Web3Provider, UpstreamProvider):
                 # safely get response date
                 response_data = err.response.json() if err.response else {}
 
-                # check if we have an error message, otherwise throw an error about the lack of error message
+                # check if we have an error message, otherwise throw an error
                 if "error" not in response_data:
                     raise AlchemyProviderError(str(err)) from err
 
