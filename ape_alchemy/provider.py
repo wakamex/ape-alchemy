@@ -2,8 +2,8 @@ import os
 import random
 import time
 from typing import Any, Dict, Iterator, List, Optional, cast
-import numpy.random as random
 
+import numpy.random as random
 from ape.api import PluginConfig, ReceiptAPI, TransactionAPI, UpstreamProvider
 from ape.exceptions import (
     APINotImplementedError,
