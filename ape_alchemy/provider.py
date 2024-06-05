@@ -1,26 +1,16 @@
 import os
 import random
 import time
-from typing import Any, Dict, List, Optional, cast
+from collections.abc import Iterable
+from typing import Any, Optional, cast
 
-from ape.api import PluginConfig, ReceiptAPI, TransactionAPI, UpstreamProvider
-from ape.exceptions import (
-    APINotImplementedError,
-    ContractLogicError,
-    ProviderError,
-    VirtualMachineError,
-)
+from ape.api import ReceiptAPI, TraceAPI, TransactionAPI, UpstreamProvider, PluginConfig
+from ape.exceptions import ContractLogicError, ProviderError, VirtualMachineError
 from ape.logging import logger
-from ape.types import CallTreeNode
 from ape_ethereum.provider import Web3Provider
+from ape_ethereum.trace import TransactionTrace
 from eth_pydantic_types import HexBytes
 from eth_typing import HexStr
-from evm_trace import (
-    ParityTraceList,
-    get_calltree_from_geth_call_trace,
-    get_calltree_from_parity_trace,
-)
-from requests import HTTPError
 from web3 import HTTPProvider, Web3
 from web3.exceptions import ContractLogicError as Web3ContractLogicError
 from web3.gas_strategies.rpc import rpc_gas_price_strategy
@@ -76,7 +66,7 @@ class Alchemy(Web3Provider, UpstreamProvider):
             A mapping of (ecosystem_name, network_name) -> URI
     """
 
-    network_uris: Dict[tuple, str] = {}
+    network_uris: dict[tuple, str] = {}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -84,7 +74,8 @@ class Alchemy(Web3Provider, UpstreamProvider):
         self.concurrency = alchemy_config.concurrency
         self.block_page_size = alchemy_config.block_page_size
         # overwrite for testing
-        self.block_page_size = 5000
+        self.block_page_size = 1_000_000
+        self.block_page_size = 2000
         self.concurrency = 1
 
     @property
@@ -161,34 +152,15 @@ class Alchemy(Web3Provider, UpstreamProvider):
     def disconnect(self):
         self._web3 = None
 
-    def _get_prestate_trace(self, txn_hash: str) -> Dict:
-        return self._debug_trace_transaction(txn_hash, "prestateTracer")
+    def _get_prestate_trace(self, transaction_hash: str) -> dict:
+        return self.make_request(
+            "debug_traceTransaction", [transaction_hash, {"tracer": "prestateTracer"}]
+        )
 
-    def get_call_tree(self, txn_hash: str) -> CallTreeNode:
-        try:
-            return self._get_calltree_using_parity_style(txn_hash)
-        except Exception as err:
-            try:
-                return self._get_calltree_using_call_tracer(txn_hash)
-            except Exception:
-                pass
-
-            raise APINotImplementedError() from err
-
-    def _get_calltree_using_parity_style(self, txn_hash: str) -> CallTreeNode:
-        raw_trace_list = self._make_request("trace_transaction", [txn_hash])
-        trace_list = ParityTraceList.model_validate(raw_trace_list)
-        evm_call = get_calltree_from_parity_trace(trace_list)
-        return self._create_call_tree_node(evm_call)
-
-    def _get_calltree_using_call_tracer(self, txn_hash: str) -> CallTreeNode:
-        # Create trace frames using geth-style call tracer
-        calls = self._debug_trace_transaction(txn_hash, "callTracer")
-        evm_call = get_calltree_from_geth_call_trace(calls)
-        return self._create_call_tree_node(evm_call, txn_hash=txn_hash)
-
-    def _debug_trace_transaction(self, txn_hash: str, tracer: str) -> Dict:
-        return self._make_request("debug_traceTransaction", [txn_hash, {"tracer": tracer}])
+    def get_transaction_trace(self, transaction_hash: str, **kwargs) -> TraceAPI:
+        if "debug_trace_transaction_parameters" not in kwargs:
+            kwargs["debug_trace_transaction_parameters"] = {}
+            return TransactionTrace(transaction_hash=transaction_hash, **kwargs)
 
     def get_virtual_machine_error(self, exception: Exception, **kwargs) -> VirtualMachineError:
         txn = kwargs.get("txn")
@@ -223,16 +195,17 @@ class Alchemy(Web3Provider, UpstreamProvider):
 
         return VirtualMachineError(message=message, txn=txn)
 
-    def _make_request(
+    def make_request(
         self,
         endpoint: str,
-        parameters: Optional[List] = None,
+        parameters: Optional[Iterable] = None,
         min_retry_delay: Optional[int] = None,
         retry_backoff_factor: Optional[int] = None,
         max_retry_delay: Optional[int] = None,
         max_retries: Optional[int] = None,
         retry_jitter: Optional[int] = None,
     ) -> Any:
+        print(f"{parameters=}")
         alchemy_config = cast(AlchemyConfig, self.config_manager.get_config("alchemy"))
         min_retry_delay = (
             min_retry_delay if min_retry_delay is not None else alchemy_config.min_retry_delay
@@ -249,25 +222,38 @@ class Alchemy(Web3Provider, UpstreamProvider):
         retry_jitter = retry_jitter if retry_jitter is not None else alchemy_config.retry_jitter
         for attempt in range(max_retries):
             try:
-                return super()._make_request(endpoint, parameters)
-            except HTTPError as err:
-                # safely get response date
-                response_data = err.response.json() if err.response else {}
-
-                # check if we have an error message, otherwise throw an error
-                if "error" not in response_data:
-                    raise AlchemyProviderError(str(err)) from err
-
+                return super().make_request(endpoint, parameters)
+            except ProviderError as err:
+                print(f"{err=}")
                 # safely get error message
-                error_data = response_data["error"]
-                message = (
-                    error_data.get("message", str(error_data))
-                    if isinstance(error_data, dict)
-                    else error_data
-                )
+                message = str(err)
 
                 # handle known error messages and continue
-                if any(
+                if "this block range should work:" in message:
+                    # extract block from error message: this block range should work: [0xef9020, 0xf0e791]
+                    # extract pieces within the square brackets
+                    block_range_match = re.search(r"\[(0x[0-9a-fA-F]+),\s*(0x[0-9a-fA-F]+)\]", message)
+                    if block_range_match:
+                        block_start_hex = block_range_match.group(1)
+                        block_start = int(block_start_hex, 16)  # Convert from hex string
+                        block_end_hex = block_range_match.group(2)
+                        block_end = int(block_end_hex, 16)
+                        block_range_int = block_start, block_end
+                        block_range_hex = f"{block_start:x}", f"{block_end:x}"
+                        print(f"Block range int: {block_range_int}")
+                        print(f"Block range hex: {block_range_hex}")
+                    else:
+                        raise AlchemyProviderError("No valid block range found in the message.")
+                    final_block = parameters["toBlock"]
+                    new_params = parameters.copy()
+                    new_params["toBlock"] = block_end_hex
+                    results = []
+                    results = super().make_request(endpoint, new_params)
+                    for d in dir(results):
+                        if not d.startswith("_"):
+                            print(f"{d=}")
+                    raise AlchemyProviderError("Testing.")
+                elif any(
                     error in message
                     for error in ["exceeded its compute units", "Too Many Requests for url"]
                 ):
